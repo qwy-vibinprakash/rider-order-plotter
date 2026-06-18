@@ -48,9 +48,12 @@ CATEGORY_STYLES = [
 # ---------------------------------------------------------------------------
 
 def load_config():
-    # Streamlit Cloud: read from st.secrets if config.json is absent
-    if hasattr(st, "secrets") and "database" in st.secrets:
-        return {"database": dict(st.secrets["database"])}
+    # Streamlit Cloud: read from st.secrets if available
+    try:
+        if "database" in st.secrets:
+            return {"database": dict(st.secrets["database"])}
+    except Exception:
+        pass
     try:
         with open(CONFIG_PATH) as f:
             return json.load(f)
@@ -861,9 +864,45 @@ def run_streaming_plot(rider_key, rider_db_id, rider_points, sessions_to_plot,
 # ---------------------------------------------------------------------------
 
 st.set_page_config(page_title="DMS Support Tool", layout="wide")
+
+
+def _check_password() -> bool:
+    """Returns True if the user is authenticated, otherwise renders a login form and returns False."""
+    if st.session_state.get("_authenticated"):
+        return True
+
+    # Resolve expected password: st.secrets → config.json fallback → None (open access)
+    try:
+        expected = st.secrets["app_password"]
+    except Exception:
+        cfg = load_config()
+        expected = cfg.get("app_password")
+
+    if not expected:
+        return True  # no password configured → open access
+
+    st.title("DMS Support Tool")
+    st.markdown("---")
+    col, _ = st.columns([1, 2])
+    with col:
+        pwd = st.text_input("Password", type="password", key="_pwd_input")
+        if st.button("Login"):
+            if pwd == expected:
+                st.session_state["_authenticated"] = True
+                st.rerun()
+            else:
+                st.error("Incorrect password.")
+    return False
+
+
+if not _check_password():
+    st.stop()
+
 st.title("DMS Support Tool")
 
-tab_plot, tab_report, tab_coverage = st.tabs(["🗺 Rider Plot", "📊 Notified Orders Report", "📋 Zone Coverage"])
+tab_plot, tab_report, tab_coverage, tab_presence = st.tabs([
+    "🗺 Rider Plot", "📊 Notified Orders Report", "📋 Zone Coverage", "👥 Rider Presence"
+])
 
 
 # ===========================================================================
@@ -1199,6 +1238,15 @@ with tab_coverage:
         horizontal=True, key="cov_sort",
     )
 
+    # Runtime region view filter — appears once results exist, no re-fetch needed
+    cov_view_regions = None
+    if "coverage_result" in st.session_state:
+        _avail = sorted(st.session_state["coverage_result"]["df"]["Region"].unique().tolist())
+        if len(_avail) > 1:
+            cov_view_regions = st.multiselect(
+                "View by Region", _avail, default=_avail, key="cov_view_regions",
+            )
+
     if cov_fetch_btn:
         if cov_from >= cov_to:
             st.error("'From' must be before 'To'.")
@@ -1209,41 +1257,38 @@ with tab_coverage:
             cov_end_utc   = IST.localize(datetime.combine(cov_date, cov_to)).astimezone(pytz.utc)
 
             with st.spinner("Fetching coverage data…"):
-                cov_rows       = fetch_zone_coverage(cov_start_utc, cov_end_utc, cov_region_ids, cov_zone_ids)
-                zone_centroids = fetch_zone_centroids(cov_start_utc, cov_end_utc, cov_region_ids, cov_zone_ids)
-                rider_coords   = fetch_punched_in_coords(cov_date)
-
-            zone_rider_counts = assign_to_nearest_zone(rider_coords, zone_centroids)
+                cov_rows = fetch_zone_coverage(cov_start_utc, cov_end_utc, cov_region_ids, cov_zone_ids)
 
             if not cov_rows:
                 st.warning("No orders found for the selected filters.")
             else:
                 df_cov = pd.DataFrame([{
-                    "Region":             r["region_name"],
-                    "Zone":               r["zone_name"],
-                    "Riders Punched In":  zone_rider_counts.get(r["zone_name"], 0),
-                    "Total Orders":       int(r["total_orders"]),
-                    "Notified":           int(r["notified"]),
-                    "Not Notified":       int(r["not_notified"]),
-                    "Coverage %":         round(int(r["notified"]) / int(r["total_orders"]) * 100, 1)
-                                          if int(r["total_orders"]) > 0 else 0.0,
+                    "Region":       r["region_name"],
+                    "Zone":         r["zone_name"],
+                    "Total Orders": int(r["total_orders"]),
+                    "Notified":     int(r["notified"]),
+                    "Not Notified": int(r["not_notified"]),
+                    "Coverage %":   round(int(r["notified"]) / int(r["total_orders"]) * 100, 1)
+                                    if int(r["total_orders"]) > 0 else 0.0,
                 } for r in cov_rows])
 
                 totals = {
-                    "Total Orders":      df_cov["Total Orders"].sum(),
-                    "Notified":          df_cov["Notified"].sum(),
-                    "Not Notified":      df_cov["Not Notified"].sum(),
-                    "Coverage %":        round(df_cov["Notified"].sum() / df_cov["Total Orders"].sum() * 100, 1)
-                                         if df_cov["Total Orders"].sum() > 0 else 0.0,
-                    "Riders Punched In": int(df_cov["Riders Punched In"].sum()),
+                    "Total Orders": df_cov["Total Orders"].sum(),
+                    "Notified":     df_cov["Notified"].sum(),
+                    "Not Notified": df_cov["Not Notified"].sum(),
+                    "Coverage %":   round(df_cov["Notified"].sum() / df_cov["Total Orders"].sum() * 100, 1)
+                                    if df_cov["Total Orders"].sum() > 0 else 0.0,
                 }
 
-                t1, t2, t3, t4, t5 = st.columns(5)
-                t1.metric("Total Orders",      int(totals["Total Orders"]))
-                t2.metric("Notified",          int(totals["Notified"]))
-                t3.metric("Not Notified",      int(totals["Not Notified"]))
-                t4.metric("Coverage %",        f"{totals['Coverage %']}%")
-                t5.metric("Riders Punched In", totals["Riders Punched In"])
+                st.session_state["coverage_result"] = {
+                    "df": df_cov, "date": cov_date, "totals": totals,
+                }
+
+                t1, t2, t3, t4 = st.columns(4)
+                t1.metric("Total Orders",  int(totals["Total Orders"]))
+                t2.metric("Notified",      int(totals["Notified"]))
+                t3.metric("Not Notified",  int(totals["Not Notified"]))
+                t4.metric("Coverage %",    f"{totals['Coverage %']}%")
 
                 if cov_sort == "Lowest coverage first":
                     df_display = df_cov.sort_values("Coverage %", ascending=True)
@@ -1251,6 +1296,8 @@ with tab_coverage:
                     df_display = df_cov.sort_values("Coverage %", ascending=False)
                 else:
                     df_display = df_cov
+                if cov_view_regions:
+                    df_display = df_display[df_display["Region"].isin(cov_view_regions)]
 
                 st.dataframe(df_display, use_container_width=True, hide_index=True)
 
@@ -1259,20 +1306,15 @@ with tab_coverage:
                 st.download_button("⬇️ Download CSV", data=cov_csv.getvalue(),
                                    file_name=f"zone_coverage_{cov_date}.csv", mime="text/csv")
 
-                st.session_state["coverage_result"] = {
-                    "df": df_cov, "date": cov_date, "totals": totals,
-                }
-
     elif "coverage_result" in st.session_state and not cov_fetch_btn:
         r = st.session_state["coverage_result"]
         st.info(f"Cached coverage for **{r['date']}**. Click '▶ Fetch Coverage' to refresh.")
         totals = r["totals"]
-        t1, t2, t3, t4, t5 = st.columns(5)
-        t1.metric("Total Orders",      int(totals["Total Orders"]))
-        t2.metric("Notified",          int(totals["Notified"]))
-        t3.metric("Not Notified",      int(totals["Not Notified"]))
-        t4.metric("Coverage %",        f"{totals['Coverage %']}%")
-        t5.metric("Riders Punched In", totals.get("Riders Punched In", "—"))
+        t1, t2, t3, t4 = st.columns(4)
+        t1.metric("Total Orders",  int(totals["Total Orders"]))
+        t2.metric("Notified",      int(totals["Notified"]))
+        t3.metric("Not Notified",  int(totals["Not Notified"]))
+        t4.metric("Coverage %",    f"{totals['Coverage %']}%")
 
         if cov_sort == "Lowest coverage first":
             df_display = r["df"].sort_values("Coverage %", ascending=True)
@@ -1280,9 +1322,119 @@ with tab_coverage:
             df_display = r["df"].sort_values("Coverage %", ascending=False)
         else:
             df_display = r["df"]
+        if cov_view_regions:
+            df_display = df_display[df_display["Region"].isin(cov_view_regions)]
 
         st.dataframe(df_display, use_container_width=True, hide_index=True)
         cov_csv = io.StringIO()
         df_display.to_csv(cov_csv, index=False)
         st.download_button("⬇️ Download CSV", data=cov_csv.getvalue(),
                            file_name=f"zone_coverage_{r['date']}.csv", mime="text/csv")
+
+
+# ===========================================================================
+# TAB 4 — RIDER PRESENCE
+# ===========================================================================
+
+with tab_presence:
+    st.header("Rider Presence by Zone")
+    st.caption(
+        "Counts riders per zone based on punch-in / punch-out coordinates. "
+        "Zone assignment uses nearest zone centroid derived from orders on the same day."
+    )
+
+    with st.expander("⚙️ Presence Settings", expanded="presence_result" not in st.session_state):
+        pr_c1, pr_c2, pr_c3 = st.columns([2, 1, 1])
+        with pr_c1:
+            pr_date = st.date_input("Date", value=date.today(), key="pr_date")
+        with pr_c2:
+            pr_from = st.time_input("From (IST)", value=time(0, 0), key="pr_from")
+        with pr_c3:
+            pr_to = st.time_input("To (IST)", value=time(23, 59), key="pr_to")
+
+        pr_all_regions = get_regions()
+        pr_region_name_to_id = {rg[1]: rg[0] for rg in pr_all_regions}
+        pr_sel_regions = st.multiselect("Regions *", list(pr_region_name_to_id.keys()), key="pr_regions")
+        pr_region_ids  = [pr_region_name_to_id[n] for n in pr_sel_regions]
+
+        pr_zone_ids = []
+        if pr_region_ids:
+            pr_all_zones = get_zones_for_regions(tuple(pr_region_ids))
+            pr_region_id_to_name = {rg[0]: rg[1] for rg in pr_all_regions}
+            pr_zone_options = {
+                f"{z[1]} ({pr_region_id_to_name.get(z[2], z[2])})": z[0]
+                for z in pr_all_zones
+            }
+            if pr_zone_options:
+                pr_sel_zones = st.multiselect(
+                    "Zones (leave empty for all)",
+                    list(pr_zone_options.keys()), key="pr_zones",
+                )
+                pr_zone_ids = [pr_zone_options[n] for n in pr_sel_zones]
+            else:
+                st.caption("No zones found for selected regions.")
+
+        pr_fetch_btn = st.button("▶ Fetch Presence", type="primary", key="pr_fetch_btn")
+
+    if pr_fetch_btn:
+        if pr_from >= pr_to:
+            st.error("'From' must be before 'To'.")
+        elif not pr_region_ids:
+            st.error("Select at least one region.")
+        else:
+            pr_start_utc = IST.localize(datetime.combine(pr_date, pr_from)).astimezone(pytz.utc)
+            pr_end_utc   = IST.localize(datetime.combine(pr_date, pr_to)).astimezone(pytz.utc)
+
+            with st.spinner("Fetching rider presence data…"):
+                zone_centroids  = fetch_zone_centroids(pr_start_utc, pr_end_utc, pr_region_ids, pr_zone_ids)
+                in_coords       = fetch_punched_in_coords(pr_date)
+                out_coords      = fetch_punched_out_coords(pr_date)
+
+            if not zone_centroids:
+                st.warning("No order data found to derive zone locations — try a broader time window.")
+            else:
+                in_counts  = assign_to_nearest_zone(in_coords,  zone_centroids)
+                out_counts = assign_to_nearest_zone(out_coords, zone_centroids)
+
+                all_zones = sorted(zone_centroids.keys())
+                df_pr = pd.DataFrame([{
+                    "Zone":             z,
+                    "Punched In":       in_counts.get(z, 0),
+                    "Punched Out":      out_counts.get(z, 0),
+                    "Still Active":     max(in_counts.get(z, 0) - out_counts.get(z, 0), 0),
+                } for z in all_zones])
+
+                total_in     = len(in_coords)
+                total_out    = len(out_coords)
+                still_active = max(total_in - total_out, 0)
+
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Total Punched In",  total_in)
+                m2.metric("Total Punched Out", total_out)
+                m3.metric("Still Active",      still_active)
+
+                st.dataframe(df_pr, use_container_width=True, hide_index=True)
+
+                pr_csv = io.StringIO()
+                df_pr.to_csv(pr_csv, index=False)
+                st.download_button("⬇️ Download CSV", data=pr_csv.getvalue(),
+                                   file_name=f"rider_presence_{pr_date}.csv", mime="text/csv")
+
+                st.session_state["presence_result"] = {
+                    "df": df_pr, "date": pr_date,
+                    "metrics": (total_in, total_out, still_active),
+                }
+
+    elif "presence_result" in st.session_state and not pr_fetch_btn:
+        r = st.session_state["presence_result"]
+        st.info(f"Cached presence for **{r['date']}**. Click '▶ Fetch Presence' to refresh.")
+        total_in, total_out, still_active = r["metrics"]
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Total Punched In",  total_in)
+        m2.metric("Total Punched Out", total_out)
+        m3.metric("Still Active",      still_active)
+        st.dataframe(r["df"], use_container_width=True, hide_index=True)
+        pr_csv = io.StringIO()
+        r["df"].to_csv(pr_csv, index=False)
+        st.download_button("⬇️ Download CSV", data=pr_csv.getvalue(),
+                           file_name=f"rider_presence_{r['date']}.csv", mime="text/csv")
