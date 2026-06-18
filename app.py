@@ -561,38 +561,32 @@ def assign_to_nearest_zone(rider_coords, zone_centroids):
 
 def fetch_daily_stats(day_date, start_utc, end_utc, region_ids):
     """
-    Three queries in one connection for a single IST calendar day:
-      Q1 – order counts + total notification pushes
-      Q2 – distinct riders who received ≥1 notification (unnest GIN array)
-      Q3 – distinct riders who punched in that day (attendance, no region filter)
-    Returns a plain dict of aggregated stats.
+    Two queries per day (down from three):
+      Q1 – single orders scan using LEFT JOIN LATERAL unnest; computes all order
+           stats + distinct riders with notifications in one pass.
+      Q2 – attendance count (different table, kept separate).
     """
     with get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
 
+            # Q1: one scan of orders_order; LATERAL unnest expands notified_rider_list
+            # so each order-rider pair is one row — DISTINCT aggregates collapse back correctly.
             cur.execute("""
                 SELECT
-                    COUNT(*)                                                                             AS total_orders,
-                    SUM(CASE WHEN cardinality(notified_rider_list) > 0               THEN 1 ELSE 0 END) AS notified_orders,
-                    SUM(CASE WHEN COALESCE(cardinality(notified_rider_list), 0) = 0  THEN 1 ELSE 0 END) AS not_notified_orders,
-                    COALESCE(SUM(cardinality(notified_rider_list)), 0)                                  AS total_notifications
-                FROM orders_order
-                WHERE draft_order = false
-                  AND created_on >= %s AND created_on < %s
-                  AND region_id = ANY(%s::integer[])
+                    COUNT(DISTINCT o.id)                                                                         AS total_orders,
+                    COUNT(DISTINCT o.id) FILTER (WHERE cardinality(o.notified_rider_list) > 0)                  AS notified_orders,
+                    COUNT(DISTINCT o.id) FILTER (WHERE COALESCE(cardinality(o.notified_rider_list), 0) = 0)     AS not_notified_orders,
+                    COUNT(rid.val)                                                                                AS total_notifications,
+                    COUNT(DISTINCT rid.val)                                                                       AS riders_with_orders
+                FROM orders_order o
+                LEFT JOIN LATERAL unnest(o.notified_rider_list) AS rid(val) ON true
+                WHERE o.draft_order = false
+                  AND o.created_on >= %s AND o.created_on < %s
+                  AND o.region_id = ANY(%s::integer[])
             """, (start_utc, end_utc, region_ids))
             o = dict(cur.fetchone())
 
-            cur.execute("""
-                SELECT COUNT(DISTINCT rid) AS cnt
-                FROM orders_order,
-                     unnest(COALESCE(notified_rider_list, ARRAY[]::integer[])) AS rid
-                WHERE draft_order = false
-                  AND created_on >= %s AND created_on < %s
-                  AND region_id = ANY(%s::integer[])
-            """, (start_utc, end_utc, region_ids))
-            riders_with_orders = int(cur.fetchone()[0] or 0)
-
+            # Q2: attendance — different table, no efficient join path
             cur.execute("""
                 SELECT COUNT(DISTINCT rider_id) AS cnt
                 FROM rider_riderattendancedetails
@@ -600,6 +594,7 @@ def fetch_daily_stats(day_date, start_utc, end_utc, region_ids):
             """, (day_date,))
             riders_punched_in = int(cur.fetchone()[0] or 0)
 
+    riders_with_orders = int(o["riders_with_orders"] or 0)
     return {
         "date":                day_date,
         "total_orders":        int(o["total_orders"] or 0),
@@ -1514,7 +1509,8 @@ _OVERALL_DESC = {
 
 
 def _overall_df(rows):
-    data = [{
+    """Pure typed DataFrame — no mixed-type description row (avoids Arrow serialization error)."""
+    return pd.DataFrame([{
         "Date":                  r["date"].strftime("%Y-%m-%d"),
         "Total Orders":          r["total_orders"],
         "Riders Punched In":     r["riders_punched_in"],
@@ -1523,14 +1519,25 @@ def _overall_df(rows):
         "Total Notifications":   r["total_notifications"],
         "Notified Orders":       r["notified_orders"],
         "Not Notified Orders":   r["not_notified_orders"],
-    } for r in rows]
-    # Description row sits at index 0 — acts as a second header in the sheet
-    return pd.DataFrame([_OVERALL_DESC] + data)
+    } for r in rows])
+
+
+def _overall_csv(df):
+    """CSV with description row injected as row 2 (between header and data)."""
+    buf = io.StringIO()
+    buf.write(",".join(f'"{c}"' for c in df.columns) + "\n")
+    buf.write(",".join(f'"{_OVERALL_DESC.get(c, "")}"' for c in df.columns) + "\n")
+    df.to_csv(buf, index=False, header=False)
+    return buf.getvalue()
 
 
 with tab_overall:
     st.header("Overall Report")
     st.caption("Day-by-day summary fetched one day at a time. Riders Punched In is system-wide (not region-filtered).")
+
+    with st.expander("ℹ️ Column descriptions", expanded=False):
+        for _col, _desc in _OVERALL_DESC.items():
+            st.markdown(f"**{_col}** — {_desc}")
 
     with st.expander("⚙️ Report Settings", expanded="overall_result" not in st.session_state):
         ov_c1, ov_c2 = st.columns(2)
@@ -1592,9 +1599,7 @@ with tab_overall:
             m3.metric("Not Notified",       int(final_df["Not Notified Orders"].sum()))
             m4.metric("Total Notifications",int(final_df["Total Notifications"].sum()))
 
-            ov_csv = io.StringIO()
-            final_df.to_csv(ov_csv, index=False)
-            table_col.download_button("⬇️ Download CSV", data=ov_csv.getvalue(),
+            table_col.download_button("⬇️ Download CSV", data=_overall_csv(final_df),
                                       file_name=f"overall_{ov_start}_{ov_end}.csv", mime="text/csv")
 
             st.session_state["overall_result"] = {
@@ -1617,7 +1622,5 @@ with tab_overall:
         m3.metric("Not Notified",        nn_ord)
         m4.metric("Total Notifications", tot_notif)
         st.dataframe(r["df"], use_container_width=True, hide_index=True)
-        ov_csv = io.StringIO()
-        r["df"].to_csv(ov_csv, index=False)
-        st.download_button("⬇️ Download CSV", data=ov_csv.getvalue(),
+        st.download_button("⬇️ Download CSV", data=_overall_csv(r["df"]),
                            file_name=f"overall_{r['start']}_{r['end']}.csv", mime="text/csv")
