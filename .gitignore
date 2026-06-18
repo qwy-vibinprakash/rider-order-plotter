@@ -1,0 +1,13 @@
+# credentials — never commit
+config.json
+.streamlit/secrets.toml
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# Streamlit cache
+.streamlit/cache/
