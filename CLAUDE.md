@@ -1,8 +1,31 @@
 # DMS Support Tool — Developer Notes
 
 ## Purpose
-Internal support tool for diagnosing rider notification issues and generating rider activity reports.
+Internal support data tool for **QWYTECH's DMS platform** — covers both:
+- `API/` — the primary DMS backend
+- `WL-DMS-API/` — the white-labelled version of the same API
+
 Connects directly to the production read-replica PostgreSQL DB. No data is stored — everything is runtime.
+Used by the support/ops team to diagnose rider notification issues, generate activity reports, and investigate order fulfilment problems across both API variants.
+
+## Source of Truth References
+
+**Schema questions** — always check the Django models in `API/` first:
+- `API/orders/models/` — orders, zones, regions
+- `API/rider/models/` — attendance, registration, blacklist
+- `API/customer/models/` — customer, blacklist
+- `API/tpl/` — TPL transactions, history, providers
+- `API/client/models/` — client, client order info
+- WL-DMS-API mirrors the same schema; divergences are rare but check `WL-DMS-API/` models when in doubt
+
+**Logging / log types** — check the logger setup in `API/`:
+- Logger names, log levels, and structured fields are defined in the API views and services — do not guess field names from ELK; verify against the logger calls in the API source
+- TEV/TPL API request logs use `log_type = "TPL API Request"` (confirmed from Kibana)
+- ELK index: `logstash` at `http://elk.qwqer.in:9200` (Kibana UI at `https://elk.qwqer.in`)
+
+## Rules for Schema Changes and Learnings
+
+> **Rule:** Every time a query reveals something non-obvious about the DB schema (missing index, unexpected column name, soft-delete pattern, table name that differs from the Django app label, etc.), add a note to the **Database Model Learnings** section below. This prevents re-discovering the same thing across sessions.
 
 ## How to run
 ```bash
@@ -164,6 +187,36 @@ Active sessions are counted separately in `active_sessions` column so they're no
 ### `customer_customerriderblacklist`
 - No soft-delete — presence of a row = active blacklist. No `deleted` or `active` column.
 
+### `settings_tplprovider`
+- TPL provider table is `settings_tplprovider`, **not** `core_tplprovider` — the app label is `settings`, not `core`.
+- Known providers: `id=11` → `tevhr solutions` (TEV/DMS external fulfillment).
+
+### `tpl_tplhistory`
+- Columns: `id`, `order_id`, `action_type` (int), `data` (jsonb), `message` (varchar), `created_at`.
+- `action_type` values observed: `0` = Failed, `1` = Created/Pushed, `2` = (minor action), `8` = Modified.
+- `data` jsonb keys: `provider` (name string), `reason` (failure message), `tpl_awb` (reference id on success).
+- Price-limit failure reason format: `"Estimated price {X} exceeds maximum price allowed {Y} ({pct}%)"` — filter with `data->>'reason' ILIKE '%Estimated price%exceeds%'`.
+- TEV failures also include: `"Too many requests."`, `"The delivery distance exceeds max distance limit!"`, `"Intercity service is unavailable"`.
+
+### `tpl_tpltransaction`
+- Columns include: `provider` (int FK to `settings_tplprovider`), `reference_id`, `is_active`, `status`, `unfulfill_reason`, `additional_info` (jsonb), `price`, `order_id`.
+- No `provider_name` column — must JOIN `settings_tplprovider` to resolve name.
+
+### `orders_clientorderinfo`
+- Table name: `orders_clientorderinfo` (app label `orders`, not `client`).
+- Key columns: `merchant_order_id`, `sub_merchant_name`, `store_name`, `store_id`, `order_id` (FK to `orders_order`).
+- `merchant_order_id` = the merchant's own reference ID — include this in any escalation export.
+
+### `orders_orderhistory`
+- Columns: `id`, `order_id`, `action` (varchar — HTML string), `action_type` (int), `details` (array), `rider_id`, `user_id`, `created_on`, `updated_at`.
+- `action_type` values observed: `4` = Created, `5` = Cancelled, `None/null` = Confirmed/status changes.
+- The `action` field is an HTML string (e.g. `"<strong> Cancelled </strong> by <strong> Merchant Name </strong>…"`) — parse carefully, do not rely on exact string matching for logic.
+- Use `created_on` (indexed) for time-window filters.
+
+### `client_client`
+- Client (B2B merchant/aggregator) table. `Adloggs Technologies` entries: IDs `2992, 3031, 3796, 4299, 4360, 4409`.
+- Adloggs is a logistics aggregator that sends orders via QWYTECH DMS — their sub-merchants (e.g. Yumove) may not appear as separate `customer_customer` rows; check `orders_clientorderinfo.sub_merchant_name` or `store_name` instead.
+
 ---
 
 ## Query Design
@@ -243,6 +296,36 @@ The `rebuild_order_traces()` function creates a fresh figure each time and uses 
 
 **`_rider_traces()` helper:** Factored out so rider markers can be added to the initial empty chart
 (before orders are fetched) AND reused in `rebuild_order_traces()` per chunk.
+
+---
+
+## Elasticsearch Query Patterns
+
+### Success / error detection for response_body field
+
+**Third Party (QWQER format) and TEV white-label:**
+- Success: `match_phrase({"response_body": "error false"})` — works because in `{"error":false}` the tokens `error` then `false` are adjacent. In error responses `{"is_success":false,"error":{...}}`, `false` precedes `error` so the phrase does NOT match.
+- Error: `match({"response_body": "QE801"})` — each QE/BE code is a distinct alphanumeric token.
+
+**Yumove TPL:**
+- **CRITICAL**: `reason_id` is ONE token in ES standard analyzer. Unicode UAX#29 ExtendNumLet rules mean underscores (connector punctuation) do NOT break words. So:
+  - ✅ `match({"response_body": "reason_id"})` → finds docs with `reason_id` field
+  - ❌ `match_phrase({"response_body": "reason id"})` → returns ZERO results (phrase needs two tokens, but token is `reason_id`)
+- Success: `{"bool": {"must": [{"term": {"response_status_code.keyword": "200"}}], "must_not": [{"match": {"response_body": "reason_id"}}]}}`
+- Error: `{"match": {"response_body": "reason_id"}}`
+
+**EK Bharat:**
+- Success: `match_phrase({"response_body": "status true"})` — `status` and `true` are separate tokens (colon separates them)
+- Error breakdown: `match_phrase` on each known error message string
+
+### Filter agg counts vs hits total
+When ES caps hits at 10,000, filter aggs still count ALL matching documents. Always use `track_total_hits=True` when you need the real total for percentage calculations.
+
+### Outbound webhook logs (`Third Party Webhook`)
+- `log_type = "Third Party Webhook"` — outbound webhook calls from QWQER to merchant endpoints
+- Key fields: `order_key` (indexed directly), `order_status` (e.g. "Accepted", "Cancelled"), `log_time` (IST timestamp), `request_data` (full order payload JSON), `response_data` (merchant HTTP response JSON with `status_code`, `content`, `response_time`), `webhook_url` (merchant's endpoint), `user` (merchant name)
+- **Do NOT search `request_body` for order IDs in webhook logs** — field is `request_data`; order key is also indexed as `order_key.keyword` for exact term queries
+- Distinct from `log_type = "Third Party Request"` (inbound merchant→QWQER calls)
 
 ---
 

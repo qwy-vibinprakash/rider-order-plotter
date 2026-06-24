@@ -5,5 +5,12 @@
         "dbname": "your_db_name",
         "user": "your_db_user",
         "password": "your_db_password"
+    },
+    "elasticsearch": {
+        "host": "https://your-es-host:9200",
+        "username": "your_es_username",
+        "password": "your_es_password",
+        "index": "logstash*",
+        "verify_certs": false
     }
 }
